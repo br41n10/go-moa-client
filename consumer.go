@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/opentracing/opentracing-go"
+	"github.com/uber/jaeger-client-go"
+	jaegercfg "github.com/uber/jaeger-client-go/config"
 	"reflect"
 	"strings"
 	"sync"
@@ -39,6 +42,28 @@ func NewMoaConsumer(confPath string, ps []Service) *MoaConsumer {
 		panic(err)
 	}
 	options = core.InitClientOption(options)
+
+	// init tracing
+	// 一般使用 go-moa-client 的程序都会先创建好 全局tracer 的，这里是以备不测
+	if !opentracing.IsGlobalTracerRegistered() {
+		// 如果 global tracer 还没有注册，我们就生成一个，
+		// 默认发送到localhost的agent上（如果有）
+		cfg := jaegercfg.Configuration{
+			ServiceName: "moa-client",
+			Sampler: &jaegercfg.SamplerConfig{
+				Type:  jaeger.SamplerTypeConst,
+				Param: 1,
+			},
+			Reporter: &jaegercfg.ReporterConfig{
+				//LogSpans: true,
+			},
+		}
+		//jLogger := jaegerlog.StdLogger
+		tracer, _, _ := cfg.NewTracer(
+			//jaegercfg.Logger(jLogger),
+		)
+		opentracing.SetGlobalTracer(tracer)
+	}
 
 	services := make(map[string]core.Service, 2)
 	consumer := &MoaConsumer{}
@@ -208,6 +233,12 @@ func (self *MoaConsumer) rpcInvoke(s core.Service, method string,
 		return retVal
 	}
 
+	// 0. 准备 tracing
+	var (
+		isTracing bool
+		childSpan opentracing.Span
+	)
+
 	now := time.Now()
 	//1.组装请求协议
 	cmd := core.MoaReqPacket{}
@@ -222,6 +253,22 @@ func (self *MoaConsumer) rpcInvoke(s core.Service, method string,
 			if ok := arg.Type().Implements(typeOfContext); ok {
 				//获取头部写入的属性值
 				ctx := arg.Interface().(context.Context)
+
+				// tracing
+				parentSpanCtx := core.GetSpanCtx(ctx) // 从当前的请求中获取 parent span
+				if parentSpanCtx != nil {             // 有parent span时我们才开启child span，否则说明调用端没有开启 tracing
+					isTracing = true
+					childSpan = opentracing.GlobalTracer().StartSpan("Call "+cmd.ServiceUri+" "+cmd.Params.Method, opentracing.ChildOf(parentSpanCtx)) // 从parent span中生成 child span
+					defer childSpan.Finish()                                                                                                           // Invoke结束时停止当前span
+					if props := ctx.Value(core.KEY_MOA_PROPERTIES); props != nil {
+						// 从 moa.props 中获取 key value 设置到 child span 的 tag
+						for k, v := range props.(map[string]string) {
+							childSpan.SetTag("moa."+k, v)
+						}
+					}
+					ctx = core.WithSpanCtx(ctx, childSpan.Context()) // 将 child span 写入 ctx
+				}
+
 				if props := ctx.Value(core.KEY_MOA_PROPERTIES); nil != props {
 					if v, ok := props.(map[string]string); ok {
 						cmd.Properties = v
@@ -238,6 +285,16 @@ func (self *MoaConsumer) rpcInvoke(s core.Service, method string,
 		args = append(args, arg.Interface())
 	}
 	cmd.Params.Args = args
+	if isTracing {
+		// 将入参写到 span log 中
+		for i, arg := range cmd.Params.Args {
+			v, err := json.Marshal(arg)
+			if err == nil {
+				childSpan.LogKV(fmt.Sprintf("param.%d", i), string(v))
+			}
+		}
+		childSpan.SetTag("moa.service_uri", cmd.ServiceUri)
+	}
 
 	wrapCost := time.Now().Sub(now) / (time.Millisecond)
 	//2.选取服务地址
@@ -273,6 +330,20 @@ func (self *MoaConsumer) rpcInvoke(s core.Service, method string,
 	}
 
 	resp := response.(core.MoaRawRespPacket)
+
+	// tracing
+	if isTracing {
+		childSpan.SetTag("resp.ec", resp.ErrCode)
+		childSpan.SetTag("resp.em", resp.Message)
+		rawJson, err := json.Marshal(resp.Result)
+		if err == nil {
+			childSpan.LogKV("resp.result", string(rawJson))
+		}
+		if resp.ErrCode != core.CODE_SERVER_SUCC {
+			childSpan.SetTag("error", true)
+		}
+	}
+
 	//获取非Error的返回类型
 	var resultType reflect.Type
 	for _, t := range outType {

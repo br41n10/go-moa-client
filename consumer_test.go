@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/blackbeans/go-moa"
+	"github.com/opentracing/opentracing-go"
 	"net"
 	"testing"
 	"time"
@@ -106,7 +107,7 @@ func TestNoGroupMakeRpcFunc(t *testing.T) {
 	//等待5s注册地址
 	time.Sleep(5 * time.Second)
 
-	consumer := NewMoaConsumer("../benchmark/conf/moa.toml",
+	consumer := NewMoaConsumer("./benchmark/conf/moa.toml",
 		[]Service{
 			Service{
 				ServiceUri: "/service/user-service",
@@ -120,6 +121,8 @@ func TestNoGroupMakeRpcFunc(t *testing.T) {
 	h := s.(*UserService)
 
 	ctx := core.AttachMoaProperty(context.Background(), "Accept-Language", "zh-CN")
+	span := opentracing.GlobalTracer().StartSpan("GetTime.Server")
+	ctx = core.WithSpanCtx(ctx, span.Context())
 	a, err := h.GetName(ctx, "a")
 	if nil != err {
 		t.Logf("--------Hello,Buddy|No Clients|%s\n", err)
@@ -205,13 +208,13 @@ func TestClientChange(t *testing.T) {
 			Interface:  &UserService{}}})
 
 	time.Sleep(10 * time.Second)
-	ips, ok := consumer.clientManager.uri2Ips["/service/user-service"]
+	ips, ok := consumer.clientManager.uri2Ips.Load("/service/user-service")
 	if !ok {
 		t.FailNow()
 	}
 	fmt.Printf("/service/user-service----------%v\n", ips)
 	exist := false
-	ips.Iterator(func(idx int, hp string) {
+	ips.(Strategy).Iterator(func(idx int, hp string) {
 		if hp == ipaddress+":13000" {
 			exist = true
 		}
@@ -231,9 +234,9 @@ func TestClientChange(t *testing.T) {
 		return
 	}
 	time.Sleep(15 * time.Second)
-	ips, ok = consumer.clientManager.uri2Ips["/service/user-service"]
+	ips, ok = consumer.clientManager.uri2Ips.Load("/service/user-service")
 	exist = false
-	ips.Iterator(func(idx int, hp string) {
+	ips.(Strategy).Iterator(func(idx int, hp string) {
 		if hp == ipaddress+":13000" {
 			exist = true
 		}
